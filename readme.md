@@ -27,6 +27,7 @@
 ```json
 {
   "http_bind": "0.0.0.0:11345",
+  "http_control_bind": "127.1:11445",
   "temp_dir": "./tmp/",
   "gc_interval": "100m",
   "cache_zone": [
@@ -36,5 +37,21 @@
   ],
   "sled": {
     "path": "./metadata"
-  }
+  },
+  "acl": [
+    {
+      "host": "doc.example.com",
+      "path_match": "/*",
+      "kind": "Cache",
+      "allow_method":["GET","HEAD"]
+    },
+    {
+      "host": "api.example.com",
+      "path_match": "/*",
+      "kind": "Proxy"
+    }
+  ]
 }
+```
+## 压缩算法支持
+- **gzip**

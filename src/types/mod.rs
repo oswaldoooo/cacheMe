@@ -1,7 +1,7 @@
 use std::pin::Pin;
 
-pub mod metadata;
 pub mod acl;
+pub mod metadata;
 pub type Hash = String;
 pub struct ObjectId {}
 pub struct ReqOption {
@@ -39,6 +39,24 @@ impl Request {
             }
         }
         None
+    }
+    pub fn get_accept_encoding(&self) -> Option<Vec<&str>> {
+        let ae = self
+            .headers
+            .get_all("accept-encoding")
+            .into_iter()
+            .filter_map(|item| {
+                if let Ok(item) = item.to_str() {
+                    return Some(item);
+                }
+                None
+            })
+            .collect::<Vec<&str>>();
+        if ae.is_empty() {
+            None
+        } else {
+            Some(ae)
+        }
     }
 }
 pub struct Response {

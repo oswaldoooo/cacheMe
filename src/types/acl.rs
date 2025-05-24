@@ -73,6 +73,9 @@ impl Acl {
             },
             Acl::Cache(cache) => match &cache.allow_method {
                 Some(allow_method) => {
+                    if allow_method.is_empty(){
+                        return true;
+                    }
                     for meth in allow_method.iter() {
                         if meth.as_str() == method {
                             return true;

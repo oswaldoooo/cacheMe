@@ -28,7 +28,35 @@ enum CacheEntry {
 }
 pub mod cache;
 pub mod storage;
+mod stream;
 pub mod types;
+
+macro_rules! insert_header_value {
+    ($header:expr,$key:expr,$val:expr) => {
+        match $header.get_mut(&$key) {
+            Some(vlist) => {
+                vlist.push($val);
+            }
+            None => {
+                $header.insert($key, vec![$val]);
+            }
+        }
+    };
+}
+macro_rules! set_header_value {
+    ($header:expr,$key:expr,$val:expr) => {
+        match $header.get_mut(&$key) {
+            Some(vlist) => {
+                vlist.clear();
+                vlist.push($val);
+            }
+            None => {
+                $header.insert($key, vec![$val]);
+            }
+        }
+    };
+}
+
 lazy_static! {
     static ref COMPLETED_REQUEST_TOTAL: prometheus::Counter =
         prometheus::register_counter!("completed_request_total", "completed request total")
@@ -230,7 +258,7 @@ impl ProxyServer {
         if rng.0 >= object_metadatab.size as i64 {
             rng.0 = (object_metadatab.size - 1) as i64;
         }
-        let stream = cache_zone
+        let mut content_stream = cache_zone
             .get_object_content(&meta.storage_path, &storage::cache_zone::GetOption { rng })
             .await?;
         meta.last_ref_time = req.timestamp;
@@ -249,6 +277,7 @@ impl ProxyServer {
             if end > start {
                 ok_status = 206;
                 if let Some(cl) = meta.headers.get_mut("content-length") {
+                    let cl = &mut cl[0];
                     *cl = (end - start).to_string();
                 }
             } else {
@@ -257,12 +286,28 @@ impl ProxyServer {
         }
         meta.headers.insert(
             "x-cache".to_string(),
-            if is_hit { "HIT" } else { "MISS" }.to_string(),
+            vec![if is_hit { "HIT" } else { "MISS" }.to_string()],
         );
+        if let Some(ae) = req.get_accept_encoding() {
+            for ae in ae {
+                if ae == "gzip" {
+                    let mut cl = 0;
+                    content_stream =
+                        stream::build_gzip_encoder_stream(content_stream, Some(&mut cl)).await?;
+                    meta.headers
+                        .insert("content-encoding".to_string(), vec!["gzip".to_string()]);
+                    let vary = "Vary".to_string();
+                    insert_header_value!(meta.headers, vary, "accept-encoding".to_string());
+                    let clstr="content-length".to_string();
+                    set_header_value!(meta.headers,clstr,cl.to_string());
+                    break;
+                }
+            }
+        }
         Ok(types::Response {
             status_code: ok_status,
             headers: conver_hashmap_to_header_map(meta.headers),
-            content: stream,
+            content: content_stream,
         })
     }
     async fn head_request(
@@ -535,6 +580,7 @@ async fn handle_request(
                     .is_match(url_path)
                 {
                     handle = Some(acl.clone().handle());
+                    break;
                 }
             }
         }
@@ -543,7 +589,8 @@ async fn handle_request(
     if handle.is_none() {
         return Ok(hyper::Response::builder()
             .status(404)
-            .header("content-length", 0).header("contention", "close")
+            .header("content-length", 0)
+            .header("contention", "close")
             .body(Full::new(bytes::Bytes::from("")))
             .unwrap());
     }
@@ -678,8 +725,8 @@ pub async fn get_random(b: &mut [u8]) -> Result<(), ErrorKind> {
 
 pub fn conver_header_map_to_hashmap(
     src: hyper::HeaderMap,
-) -> Result<std::collections::HashMap<String, String>, ErrorKind> {
-    let mut ret = std::collections::HashMap::new();
+) -> Result<std::collections::HashMap<String, Vec<String>>, ErrorKind> {
+    let mut ret: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     src.into_iter().all(|(k, v)| {
         if k.is_none() {
             return true;
@@ -687,7 +734,15 @@ pub fn conver_header_map_to_hashmap(
         match v.to_str() {
             Ok(value) => {
                 let value = value.to_string();
-                ret.insert(k.unwrap().to_string(), value);
+                let k = k.unwrap().to_string();
+                match ret.get_mut(&k) {
+                    Some(vlist) => {
+                        vlist.push(value);
+                    }
+                    None => {
+                        ret.insert(k, vec![value]);
+                    }
+                }
             }
             Err(_) => {}
         }
@@ -696,14 +751,16 @@ pub fn conver_header_map_to_hashmap(
     Ok(ret)
 }
 pub fn conver_hashmap_to_header_map(
-    src: std::collections::HashMap<String, String>,
+    src: std::collections::HashMap<String, Vec<String>>,
 ) -> hyper::HeaderMap {
     let mut ret = hyper::HeaderMap::new();
     src.into_iter().all(|(k, v)| {
-        ret.insert(
-            hyper::header::HeaderName::from_str(&k).unwrap(),
-            hyper::header::HeaderValue::from_str(&v).unwrap(),
-        );
+        for v in v {
+            ret.append(
+                hyper::header::HeaderName::from_str(&k).unwrap(),
+                hyper::header::HeaderValue::from_str(&v).unwrap(),
+            );
+        }
         true
     });
     ret

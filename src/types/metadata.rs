@@ -1,7 +1,7 @@
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ObjectMetaData {
     pub status_code: u16,                                   /*上游响应码 */
-    pub headers: std::collections::HashMap<String, String>, /*上游响应头 */
+    pub headers: std::collections::HashMap<String, Vec<String>>, /*上游响应头 */
     pub size: usize,                                        /*响应体大小 */
     pub method: String,                                     /*请求方法 */
     pub url_path: String,                                   /*url路径 */
@@ -20,7 +20,7 @@ pub struct ObjectMetaData {
 impl ObjectMetaData {
     pub fn last_modified(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         if let Some(last_modified) = self.headers.get("last-modified") {
-            if let Ok(datetime) = chrono::DateTime::parse_from_rfc2822(&last_modified) {
+            if let Ok(datetime) = chrono::DateTime::parse_from_rfc2822(&last_modified[0]) {
                 return Some(datetime.to_utc());
             }
         }
