@@ -1,4 +1,4 @@
-use futures_util::{future::ok, TryStreamExt};
+use futures_util::TryStreamExt;
 use http_body_util::Full;
 use hyper::{
     body::{Body, Incoming},
@@ -106,20 +106,27 @@ pub struct ProxyServer {
     cache: cache::Cache,
     cache_zone: Vec<Pin<Box<dyn storage::cache_zone::CacheZone + Send + Sync>>>,
     acl: std::collections::HashMap<String, Vec<types::acl::Acl>>,
+    share_stat: std::collections::HashMap<String, ShareState>,
 }
 
 impl ProxyServer {
-    pub const fn new(
+    pub fn new(
         temp_dir: String,
         db: Pin<Box<dyn storage::database::Database + Send + Sync + 'static>>,
         cache_zone: Vec<Pin<Box<dyn storage::cache_zone::CacheZone + Send + Sync>>>,
         acl: std::collections::HashMap<String, Vec<types::acl::Acl>>,
     ) -> Self {
+        let mut ss = std::collections::HashMap::default();
+        acl.iter().all(|(k, _)| {
+            ss.insert(k.to_string(), ShareState::default());
+            true
+        });
         Self {
             temp_dir: temp_dir,
             cache: cache::Cache::new(db),
             cache_zone: cache_zone,
             acl: acl,
+            share_stat: ss,
         }
     }
     async fn run_gc(&self) {
@@ -192,15 +199,30 @@ impl ProxyServer {
         } else {
             (-1, -1)
         };
-        if !is_hit {
+        let host_stat = self.share_stat.get(req.host.as_str()).unwrap();
+        if !is_hit && host_stat.try_upstream(hash.clone()).await {
             //回源拿
-            let resp = self.sub_request(&req).await?;
-            match self.build_object_meta(&req, &hash, resp).await? {
+            let resp = match self.sub_request(&req).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    host_stat.release_upstream(&hash, true).await;
+                    return Err(err);
+                }
+            };
+            let ret = match self.build_object_meta(&req, &hash, resp).await {
+                Ok(ret) => ret,
+                Err(err) => {
+                    host_stat.release_upstream(&hash, true).await;
+                    return Err(err);
+                }
+            };
+            match ret {
                 CacheEntry::MetaData(mut object_meta_data) => {
                     let cache_zone = self.cache_zone.get(object_meta_data.cache_zone as usize);
                     match cache_zone {
                         Some(cache_zone) => {
                             if !cache_zone.is_ok() {
+                                host_stat.release_upstream(&hash, true).await;
                                 return Err(ErrorKind::MachineError(format!(
                                     "cache_zone {} is not ok",
                                     object_meta_data.cache_zone
@@ -214,18 +236,24 @@ impl ProxyServer {
                                     object_meta_data.storage_path = real_path;
                                 }
                                 Err(err) => {
-                                    log::error!(
+                                    host_stat.release_upstream(&hash, true).await;
+                                    return Err(ErrorKind::MachineError(format!(
                                         "cache_zone {} link_temp {} return error {err}",
-                                        object_meta_data.cache_zone,
-                                        object_meta_data.storage_path
-                                    );
+                                        object_meta_data.cache_zone, object_meta_data.storage_path
+                                    )));
                                 }
                             }
                         }
                         None => {
-                            log::error!("cache_zone {} get failed", object_meta_data.cache_zone)
+                            host_stat.release_upstream(&hash, true).await;
+                            // log::error!("cache_zone {} get failed", object_meta_data.cache_zone)
+                            return Err(ErrorKind::MachineError(format!(
+                                "cache_zone {} get failed",
+                                object_meta_data.cache_zone
+                            )));
                         }
                     }
+                    host_stat.release_upstream(&hash, false).await;
                     meta = Some(object_meta_data);
                 }
                 CacheEntry::Response(response) => {
@@ -235,6 +263,12 @@ impl ProxyServer {
         }
         if is_hit {
             HIT_TOTAL.inc();
+        } else {
+            if host_stat.wait_upstream(&hash).await {
+                return Err(ErrorKind::OperateError(format!(
+                    "other upstream failed.hashkey={hash} use same result"
+                )));
+            }
         }
         let mut meta = meta.unwrap();
         let cache_zone = self.cache_zone.get(meta.cache_zone as usize);
@@ -298,8 +332,8 @@ impl ProxyServer {
                         .insert("content-encoding".to_string(), vec!["gzip".to_string()]);
                     let vary = "Vary".to_string();
                     insert_header_value!(meta.headers, vary, "accept-encoding".to_string());
-                    let clstr="content-length".to_string();
-                    set_header_value!(meta.headers,clstr,cl.to_string());
+                    let clstr = "content-length".to_string();
+                    set_header_value!(meta.headers, clstr, cl.to_string());
                     break;
                 }
             }
@@ -840,5 +874,73 @@ impl RequestHandler for types::acl::Cache {
 impl RequestHandler for types::acl::Proxy {
     fn handle(self) -> ServiceHandleFunc {
         todo!()
+    }
+}
+#[derive(Default)]
+struct ShareState {
+    upstream_lock: Mutex<std::collections::HashMap<types::Hash, UpstreamStat>>, /*正在回源的hashkey */
+}
+#[derive(Default)]
+struct UpstreamStat {
+    is_released: std::sync::atomic::AtomicBool,
+    fail: std::sync::atomic::AtomicBool, /*回源是否失败 */
+    notifier: tokio::sync::Notify,
+}
+
+impl UpstreamStat {
+    async fn release(&self, failed: bool) {
+        if self.is_released.load(std::sync::atomic::Ordering::Acquire) {
+            panic!("upstream lock released by more than one time")
+        }
+        self.is_released
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.fail
+            .store(failed, std::sync::atomic::Ordering::Release);
+        self.notifier.notify_waiters();
+    }
+    async fn wait(&self) -> bool {
+        if !self.is_released.load(std::sync::atomic::Ordering::Acquire) {
+            return self.fail.load(std::sync::atomic::Ordering::Acquire);
+        }
+        self.notifier.notified().await;
+        if !self.is_released.load(std::sync::atomic::Ordering::Acquire) {
+            panic!("upstream lock is not released")
+        }
+        self.fail.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+struct ShareStateGuard<'a> {
+    ss: &'a ShareState,
+    key: String,
+}
+
+impl ShareState {
+    async fn try_upstream(&self, key: types::Hash) -> bool {
+        let mut l = self.upstream_lock.lock().await;
+        if l.contains_key(&key) {
+            return false;
+        } else {
+            l.insert(key, UpstreamStat::default());
+            return true;
+        }
+    }
+    async fn release_upstream(&self, key: &types::Hash, failed: bool) {
+        let mut l = self.upstream_lock.lock().await;
+        let val = l.remove(key);
+        if val.is_none() {
+            panic!("lock {key} is unsafely, lock release by other");
+        }
+        let val = val.unwrap();
+        val.release(failed).await;
+    }
+    async fn wait_upstream(&self, key: &types::Hash) -> bool {
+        let l = self.upstream_lock.lock().await;
+        let stat = l.get(key);
+        if stat.is_none() {
+            return false;
+        }
+        let stat = stat.unwrap();
+        stat.wait().await
     }
 }
