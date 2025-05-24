@@ -382,7 +382,7 @@ impl ProxyServer {
                 "range" => {
                     continue;
                 }
-                "accept-encoding" => {},
+                "accept-encoding" => {}
                 _ => {}
             }
             headers.insert(k, v.clone());
@@ -590,7 +590,22 @@ async fn handle_request(
 ) -> Result<hyper::Response<Full<bytes::Bytes>>, Infallible> {
     let headers = req.headers();
     let uri = req.uri();
-    let host = uri.host();
+    let host = {
+        match uri.host() {
+            Some(host) => Some(host),
+            None => {
+                if let Some(host) = req.headers().get("host") {
+                    if let Ok(host) = host.to_str() {
+                        Some(host)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    };
     if host.is_none() {
         log::info!("request not set host");
         return Ok(hyper::Response::builder()
@@ -701,6 +716,7 @@ async fn handle_metrics_request(
         let ret = match encoder.encode(&prometheus::gather(), &mut data) {
             Ok(_) => hyper::Response::builder()
                 .status(200)
+                .header("content-type", encoder.format_type())
                 .body(Full::new(bytes::Bytes::from(data)))
                 .unwrap(),
             Err(err) => {

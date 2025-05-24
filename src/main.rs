@@ -78,7 +78,8 @@ struct Config {
 }
 #[derive(serde::Deserialize)]
 struct CacheZoneConfig {
-    generic: Option<String>,
+    path: String,
+    water_level: Option<f64>,
 }
 #[derive(serde::Deserialize)]
 struct SledConfig {
@@ -88,12 +89,12 @@ struct SledConfig {
 async fn load_cache_zone(
     cnf: &CacheZoneConfig,
 ) -> Result<Pin<Box<dyn cache_me::storage::cache_zone::CacheZone + Send + Sync>>, String> {
-    if let Some(generic) = &cnf.generic {
-        let cd = cache_me::storage::cache_zone::disk::CommonDisk::from_str(&generic)
-            .map_err(|err| format!("{err}"))?;
-        return Ok(Box::pin(cd));
-    }
-    return Err("not set any driver".to_string());
+    let cd = cache_me::storage::cache_zone::disk::CommonDisk::try_from((
+        cnf.path.as_str(),
+        cnf.water_level.map_or(95.0, |water_level| water_level),
+    ))
+    .map_err(|err| format!("{err}"))?;
+    return Ok(Box::pin(cd));
 }
 async fn load_database(
     cnf: &Config,
