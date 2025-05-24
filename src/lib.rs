@@ -97,6 +97,23 @@ impl ProxyServer {
             if (meta.expire + meta.first_time_ref) <= req.timestamp {
                 is_hit = false;
             }
+            if let Some(if_none_match) = req.get_if_none_match() {
+                if if_none_match != meta.etag.as_str() {
+                    is_hit = false;
+                }
+            } else if let Some(if_modified_since) = req.get_if_modified_since() {
+                if let Some(last_modified) = meta.last_modified() {
+                    if last_modified <= if_modified_since {
+                        let cursor = std::io::Cursor::new("".as_bytes());
+                        let buffreader = tokio::io::BufReader::new(cursor);
+                        return Ok(types::Response {
+                            status_code: 304,
+                            headers: http::HeaderMap::default(),
+                            content: Box::pin(buffreader),
+                        });
+                    }
+                }
+            }
         }
         let mut rng = if let Some(rng) = req.headers.get("range") {
             if let Ok(rng) = rng.to_str() {
@@ -167,11 +184,11 @@ impl ProxyServer {
             )));
         }
         let object_metadatab = cache_zone.get_object_meta(&meta.storage_path).await?;
-        if rng.1>=object_metadatab.size as i64{
-            rng.1=(object_metadatab.size-1) as i64;
+        if rng.1 >= object_metadatab.size as i64 {
+            rng.1 = (object_metadatab.size - 1) as i64;
         }
-        if rng.0>=object_metadatab.size as i64{
-            rng.0=(object_metadatab.size-1) as i64;
+        if rng.0 >= object_metadatab.size as i64 {
+            rng.0 = (object_metadatab.size - 1) as i64;
         }
         let stream = cache_zone
             .get_object_content(&meta.storage_path, &storage::cache_zone::GetOption { rng })
@@ -332,7 +349,13 @@ impl ProxyServer {
                 return Err(err);
             }
         };
+        let etag = if let Some(etag) = resp.headers.get("etag") {
+            etag.to_str().map_or("".to_string(), |v| v.to_string())
+        } else {
+            "".to_string()
+        };
         let ret = types::metadata::ObjectMetaData {
+            etag: etag,
             status_code: resp.status_code,
             headers: conver_header_map_to_hashmap(resp.headers)?,
             size: fsize,
