@@ -89,17 +89,44 @@ impl ProxyServer {
             log::error!("run_gc failed {err}");
         }
     }
+    async fn remove_object(&self, hash: &types::Hash, meta: &types::metadata::ObjectMetaData) {
+        if let Err(err) = self.cache.remove_object(hash).await {
+            log::error!("remove object metadata {hash} error {err}");
+        }
+        if let Some(cache_zone) = self.cache_zone.get(meta.cache_zone as usize) {
+            if let Err(err) = cache_zone.remove_object(&meta.storage_path).await {
+                log::error!(
+                    "remove cache_zone {} path {} error {err}",
+                    meta.cache_zone,
+                    meta.storage_path
+                );
+            }
+        }
+    }
     async fn handle_request(&self, req: types::Request) -> Result<types::Response, ErrorKind> {
         let hash = get_hash_v1(&req.method, &req.host, &req.url_path);
         let mut meta = self.cache.get_object(&hash).await?;
         let mut is_hit = meta.is_some();
         if let Some(meta) = &meta {
             if (meta.expire + meta.first_time_ref) <= req.timestamp {
+                self.remove_object(&hash, meta).await;
                 is_hit = false;
             }
             if let Some(if_none_match) = req.get_if_none_match() {
                 if if_none_match != meta.etag.as_str() {
-                    is_hit = false;
+                    let resp = self.head_request(&req).await?;
+                    if resp.0 == 304 {
+                        is_hit = false;
+                    } else if resp.0 == 200 {
+                        if let Some(etag) = resp.1.get("etag") {
+                            if let Ok(etag) = etag.to_str() {
+                                if etag != meta.etag.as_str() {
+                                    self.remove_object(&hash, meta).await;
+                                    is_hit = false;
+                                }
+                            }
+                        }
+                    }
                 }
             } else if let Some(if_modified_since) = req.get_if_modified_since() {
                 if let Some(last_modified) = meta.last_modified() {
@@ -224,6 +251,29 @@ impl ProxyServer {
             headers: conver_hashmap_to_header_map(meta.headers),
             content: stream,
         })
+    }
+    async fn head_request(
+        &self,
+        raw_req: &types::Request,
+    ) -> Result<(u16, hyper::HeaderMap), ErrorKind> {
+        let url = format!("http://{}{}", raw_req.host, raw_req.url_path);
+        let mut req = reqwest::Request::new(
+            http::Method::HEAD,
+            url.parse()
+                .map_err(|err| ErrorKind::LogicalError(format!("build logical error {err}")))?,
+        );
+        let headers = req.headers_mut();
+        for (k, v) in &raw_req.headers {
+            if k.as_str() == "range" {
+                continue;
+            }
+            headers.insert(k, v.clone());
+        }
+        let resp = reqwest::Client::new()
+            .execute(req)
+            .await
+            .map_err(|err| ErrorKind::OperateError(format!("upstream {url} failed {err}")))?;
+        Ok((resp.status().as_u16(), resp.headers().to_owned()))
     }
     async fn sub_request(&self, raw_req: &types::Request) -> Result<types::Response, ErrorKind> {
         let url = format!("http://{}{}", raw_req.host, raw_req.url_path);
