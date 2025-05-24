@@ -12,6 +12,7 @@ use prometheus::Encoder;
 use std::{
     convert::Infallible,
     fmt::{Debug, Display},
+    future::Future,
     io::Write,
     os::unix::fs::MetadataExt,
     path::Path,
@@ -27,7 +28,7 @@ enum CacheEntry {
 }
 pub mod cache;
 pub mod storage;
-mod types;
+pub mod types;
 lazy_static! {
     static ref COMPLETED_REQUEST_TOTAL: prometheus::Counter =
         prometheus::register_counter!("completed_request_total", "completed request total")
@@ -40,7 +41,13 @@ lazy_static! {
     static ref MISS_TOTAL: prometheus::Counter =
         prometheus::register_counter!("miss_total", "miss total").unwrap();
 }
-
+type ServiceHandleFunc = Box<
+    dyn Send
+        + Fn(
+            Arc<ProxyServer>,
+            types::Request,
+        ) -> Pin<Box<dyn Future<Output = Result<types::Response, ErrorKind>> + Send>>,
+>;
 pub enum ErrorKind {
     MachineError(String), /*硬件错误，例如访问文件磁盘错误 */
     LogicalError(String), /*逻辑错误，比如不符合规则，鉴权失败 */
@@ -70,6 +77,7 @@ pub struct ProxyServer {
     temp_dir: String,
     cache: cache::Cache,
     cache_zone: Vec<Pin<Box<dyn storage::cache_zone::CacheZone + Send + Sync>>>,
+    acl: std::collections::HashMap<String, Vec<types::acl::Acl>>,
 }
 
 impl ProxyServer {
@@ -77,11 +85,13 @@ impl ProxyServer {
         temp_dir: String,
         db: Pin<Box<dyn storage::database::Database + Send + Sync + 'static>>,
         cache_zone: Vec<Pin<Box<dyn storage::cache_zone::CacheZone + Send + Sync>>>,
+        acl: std::collections::HashMap<String, Vec<types::acl::Acl>>,
     ) -> Self {
         Self {
             temp_dir: temp_dir,
             cache: cache::Cache::new(db),
             cache_zone: cache_zone,
+            acl: acl,
         }
     }
     async fn run_gc(&self) {
@@ -103,7 +113,10 @@ impl ProxyServer {
             }
         }
     }
-    async fn handle_request(&self, req: types::Request) -> Result<types::Response, ErrorKind> {
+    async fn hanlde_cache_request(
+        &self,
+        req: types::Request,
+    ) -> Result<types::Response, ErrorKind> {
         let hash = get_hash_v1(&req.method, &req.host, &req.url_path);
         let mut meta = self.cache.get_object(&hash).await?;
         let mut is_hit = meta.is_some();
@@ -505,16 +518,48 @@ async fn handle_request(
     let host = host.unwrap();
     let url_path = uri.path();
     let method = req.method().as_str();
+    let acl = server.acl.get(host);
+    if let None = &acl {
+        return Ok(hyper::Response::builder()
+            .status(404)
+            .body(Full::new(bytes::Bytes::from("")))
+            .unwrap());
+    }
+    let handle: Option<ServiceHandleFunc> = {
+        let acl = acl.unwrap();
+        let mut handle: Option<ServiceHandleFunc> = None;
+        for acl in acl {
+            if acl.method_match(method) {
+                if regex::Regex::new(acl.path_match())
+                    .unwrap()
+                    .is_match(url_path)
+                {
+                    handle = Some(acl.clone().handle());
+                }
+            }
+        }
+        handle
+    };
+    if handle.is_none() {
+        return Ok(hyper::Response::builder()
+            .status(404)
+            .header("content-length", 0).header("contention", "close")
+            .body(Full::new(bytes::Bytes::from("")))
+            .unwrap());
+    }
+
     let current = chrono::Utc::now().timestamp();
-    let ret = server
-        .handle_request(types::Request {
+    let ret = handle.unwrap()(
+        server,
+        types::Request {
             host: host.to_string(),
             method: method.to_string(),
             url_path: url_path.to_string(),
             headers: headers.to_owned(),
             timestamp: current,
-        })
-        .await;
+        },
+    )
+    .await;
     COMPLETED_REQUEST_TOTAL.inc();
     match ret {
         Ok(mut resp) => {
@@ -714,4 +759,29 @@ fn parse_range(rng: &str) -> (i64, i64) {
     }
 
     (start, end)
+}
+
+pub trait RequestHandler {
+    fn handle(self) -> ServiceHandleFunc;
+}
+
+impl RequestHandler for types::acl::Acl {
+    fn handle(self) -> ServiceHandleFunc {
+        match self {
+            types::acl::Acl::Proxy(proxy) => proxy.handle(),
+            types::acl::Acl::Cache(cache) => cache.handle(),
+        }
+    }
+}
+
+impl RequestHandler for types::acl::Cache {
+    fn handle(self) -> ServiceHandleFunc {
+        Box::new(move |server, req| Box::pin(async move { server.hanlde_cache_request(req).await }))
+    }
+}
+
+impl RequestHandler for types::acl::Proxy {
+    fn handle(self) -> ServiceHandleFunc {
+        todo!()
+    }
 }

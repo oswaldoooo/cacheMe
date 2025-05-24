@@ -24,7 +24,22 @@ async fn main() -> Result<(), String> {
     if cache_zone.is_empty() {
         return Err("cache_zone not set".to_string());
     }
-    let server = cache_me::ProxyServer::new(cnf.temp_dir, db, cache_zone);
+    let mut host_acl: std::collections::HashMap<String, Vec<cache_me::types::acl::Acl>> =
+        std::collections::HashMap::default();
+    cnf.acl.iter().all(|acl| {
+        let host = acl.host();
+        let list = host_acl.get_mut(host);
+        match list {
+            Some(list) => {
+                list.push(acl.clone());
+            }
+            None => {
+                host_acl.insert(host.to_string(), vec![acl.clone()]);
+            }
+        }
+        true
+    });
+    let server = cache_me::ProxyServer::new(cnf.temp_dir, db, cache_zone, host_acl);
     let server = Arc::new(server);
     let gc_interval = cache_me::parse_duration(cnf.gc_interval)?;
 
@@ -59,6 +74,7 @@ struct Config {
     gc_interval: String,
     cache_zone: Vec<CacheZoneConfig>,
     sled: Option<SledConfig>,
+    acl: Vec<cache_me::types::acl::Acl>,
 }
 #[derive(serde::Deserialize)]
 struct CacheZoneConfig {

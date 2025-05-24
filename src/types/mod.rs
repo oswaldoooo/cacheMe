@@ -1,7 +1,7 @@
 use std::pin::Pin;
 
 pub mod metadata;
-
+pub mod acl;
 pub type Hash = String;
 pub struct ObjectId {}
 pub struct ReqOption {
