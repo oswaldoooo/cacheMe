@@ -378,8 +378,12 @@ impl ProxyServer {
         );
         let headers = req.headers_mut();
         for (k, v) in &raw_req.headers {
-            if k.as_str() == "range" {
-                continue;
+            match k.as_str() {
+                "range" => {
+                    continue;
+                }
+                "accept-encoding" => {},
+                _ => {}
             }
             headers.insert(k, v.clone());
         }
