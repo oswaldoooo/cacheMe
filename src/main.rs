@@ -3,7 +3,7 @@ use std::{pin::Pin, str::FromStr, sync::Arc, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), String> {
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Error)
         .init();
     let mut args = std::env::args();
     args.next();
@@ -47,9 +47,6 @@ async fn main() -> Result<(), String> {
         let server = server.clone();
         async move { cache_me::run_daemon(gc_interval, server).await }
     });
-    let l = tokio::net::TcpListener::bind(&cnf.http_bind)
-        .await
-        .map_err(|err| format!("bind {} error {err}", cnf.http_bind))?;
     if let Some(control_bind) = &cnf.http_control_bind {
         let control_bind = control_bind.clone();
         tokio::spawn(async move {
@@ -60,7 +57,7 @@ async fn main() -> Result<(), String> {
         });
     }
     tokio::spawn(run_resource_stats());
-    cache_me::listen_and_server(l, server)
+    cache_me::listen_and_server(&cnf.http_bind, server)
         .await
         .expect("listen_and_server failed");
     Ok(())

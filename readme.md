@@ -33,7 +33,7 @@
   "gc_interval": "100m",
   "cache_zone": [
     {
-      "generic": "cache_zone0"
+      "path": "cache_zone0"
     }
   ],
   "sled": {
@@ -56,3 +56,13 @@
 ```
 ## 压缩算法支持
 - **gzip**
+
+## 基准测试（Benchmark）
+
+使用 [wrk](https://github.com/wg/wrk) 工具对 2Mib 文件全hit进行压测，环境为 Apple M1 Pro. CacheMe占用 5 核 CPU，wrk 2 线程，200 并发连接，持续 60 秒：
+
+```bash
+wrk -t2 -c200 -d60s http://127.0.0.1:11345/test.dat -H 'Host: example.com'
+
+```
+![alt text](image.png)

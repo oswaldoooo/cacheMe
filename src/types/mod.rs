@@ -9,12 +9,15 @@ pub struct ReqOption {
     pub method: String,
     pub request_time: i64, /*接收到请求时的时间戳 */
 }
-
+#[cfg(feature="hyper")]
+type HeaderMap=hyper::HeaderMap;
+#[cfg(feature="actix")]
+type HeaderMap=actix_http::header::HeaderMap;
 pub struct Request {
     pub host: String,
     pub method: String,
     pub url_path: String,
-    pub headers: hyper::HeaderMap,
+    pub headers: HeaderMap,
     pub timestamp: i64,
 }
 impl Request {
@@ -62,5 +65,9 @@ impl Request {
 pub struct Response {
     pub status_code: u16,
     pub headers: hyper::HeaderMap,
-    pub content: Pin<Box<dyn tokio::io::AsyncRead + Send + Sync>>,
+    pub content: Content,
+}
+pub enum Content{
+    Stream(Pin<Box<dyn tokio::io::AsyncRead + Send+Sync>>),
+    Path(String),
 }

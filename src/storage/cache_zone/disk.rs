@@ -1,5 +1,6 @@
 use crate::ErrorKind;
 use async_trait::async_trait;
+use lazy_static::lazy_static;
 use md5::Digest;
 use std::{io::Write, os::unix::fs::MetadataExt, path::Path, pin::Pin, str::FromStr, task::Poll};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, ReadBuf};
@@ -12,11 +13,17 @@ pub struct CommonDisk {
     total_size: usize,
     error_count: usize,
 }
+lazy_static! {
+    static ref COMMONDISK_GET_CONTENT_TOTAL: prometheus::Counter = prometheus::register_counter!(
+        "common_disk_get_content_total",
+        "common disk get content total"
+    )
+    .unwrap();
+}
+impl TryFrom<(&str, f64)> for CommonDisk {
+    type Error = ErrorKind;
 
-impl TryFrom<(&str,f64)> for CommonDisk {
-    type Error=ErrorKind;
-
-    fn try_from(value: (&str,f64)) -> Result<Self, Self::Error> {
+    fn try_from(value: (&str, f64)) -> Result<Self, Self::Error> {
         let disks = sysinfo::Disks::new_with_refreshed_list();
         let _ = std::fs::create_dir_all(value.0);
         let sp = Path::new(value.0);
@@ -69,6 +76,13 @@ impl super::CacheZone for CommonDisk {
             error_count: self.error_count,
         };
     }
+    fn get_object_path(&self, path: &str) -> String {
+        Path::new(self.parent_dir.as_str())
+            .join(path)
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
     async fn get_object_content(
         &self,
         path: &str,
@@ -86,8 +100,10 @@ impl super::CacheZone for CommonDisk {
         if opts.rng.1 > 0 && opts.rng.1 > opts.rng.0 {
             let start = if opts.rng.0 < 0 { 0 } else { opts.rng.0 };
             let fd = fd.take((opts.rng.1 - start + 1) as u64);
+            COMMONDISK_GET_CONTENT_TOTAL.inc();
             return Ok(Box::pin(fd));
         }
+        COMMONDISK_GET_CONTENT_TOTAL.inc();
         Ok(Box::pin(fd))
     }
     async fn get_object_meta(&self, path: &str) -> Result<super::MetaData, ErrorKind> {

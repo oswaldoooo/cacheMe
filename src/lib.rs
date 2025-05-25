@@ -1,5 +1,9 @@
+use actix_web::{
+    body::MessageBody, dev::ServiceResponse, http::StatusCode, middleware::Next,
+    HttpResponseBuilder,
+};
 use futures_util::TryStreamExt;
-use http_body_util::Full;
+use http_body_util::{combinators::BoxBody, BodyExt, BodyStream, Full, StreamBody};
 use hyper::{
     body::{Body, Incoming},
     server::conn::http1,
@@ -22,6 +26,8 @@ use std::{
     time::Duration,
 };
 use tokio::{io::AsyncReadExt, sync::Mutex};
+use tokio_util::io::ReaderStream;
+use tracing::instrument;
 enum CacheEntry {
     MetaData(types::metadata::ObjectMetaData),
     Response(types::Response),
@@ -58,12 +64,25 @@ macro_rules! set_header_value {
 }
 
 lazy_static! {
-    static ref COMPLETED_REQUEST_TOTAL: prometheus::Counter =
-        prometheus::register_counter!("completed_request_total", "completed request total")
+    static ref COMPLETED_REQUEST_TOTAL: prometheus::IntCounter =
+        prometheus::register_int_counter!("completed_request_total", "completed request total")
             .unwrap();
-    static ref SERVER_INTERNAL_ERROR_TOTAL: prometheus::Counter =
-        prometheus::register_counter!("server_internal_error_total", "server internal error total")
+    static ref HANDLE_REQUEST_TOTAL: prometheus::IntCounter =
+        prometheus::register_int_counter!("handle_request_total", "handle request total").unwrap();
+    static ref STREAM_RESPONSE_TOTAL: prometheus::IntCounter =
+        prometheus::register_int_counter!("stream_response_total", "stream response total")
             .unwrap();
+    static ref FILE_RESPONSE_TOTAL: prometheus::IntCounter =
+        prometheus::register_int_counter!("file_response_total", "file response total")
+            .unwrap();
+    static ref RESPONSE_BYTES_TOTAL: prometheus::IntCounter =
+        prometheus::register_int_counter!("response_bytes_total", "response bytes total").unwrap();
+    static ref SERVER_INTERNAL_ERROR_TOTAL: prometheus::IntCounter =
+        prometheus::register_int_counter!(
+            "server_internal_error_total",
+            "server internal error total"
+        )
+        .unwrap();
     static ref HIT_TOTAL: prometheus::Counter =
         prometheus::register_counter!("hit_total", "hit total").unwrap();
     static ref MISS_TOTAL: prometheus::Counter =
@@ -108,7 +127,13 @@ pub struct ProxyServer {
     acl: std::collections::HashMap<String, Vec<types::acl::Acl>>,
     share_stat: std::collections::HashMap<String, ShareState>,
 }
-
+impl Debug for ProxyServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyServer")
+            .field("temp_dir", &self.temp_dir)
+            .finish()
+    }
+}
 impl ProxyServer {
     pub fn new(
         temp_dir: String,
@@ -184,7 +209,7 @@ impl ProxyServer {
                         return Ok(types::Response {
                             status_code: 304,
                             headers: http::HeaderMap::default(),
-                            content: Box::pin(buffreader),
+                            content: types::Content::Stream(Box::pin(buffreader)),
                         });
                     }
                 }
@@ -292,14 +317,11 @@ impl ProxyServer {
         if rng.0 >= object_metadatab.size as i64 {
             rng.0 = (object_metadatab.size - 1) as i64;
         }
-        let mut content_stream = cache_zone
-            .get_object_content(&meta.storage_path, &storage::cache_zone::GetOption { rng })
-            .await?;
         meta.last_ref_time = req.timestamp;
         meta.ref_count = meta.ref_count + 1;
-        if let Err(err) = self.cache.put_object(&hash, &meta).await {
-            log::error!("put object metadata failed {err}");
-        }
+        // if let Err(err) = self.cache.put_object(&hash, &meta).await {
+        //     log::error!("put object metadata failed {err}");
+        // }
         let mut ok_status = meta.status_code;
         if rng.1 > 0 || rng.0 > 0 {
             let end = if rng.1 > 0 {
@@ -322,12 +344,20 @@ impl ProxyServer {
             "x-cache".to_string(),
             vec![if is_hit { "HIT" } else { "MISS" }.to_string()],
         );
+        let mut content = types::Content::Path(cache_zone.get_object_path(&meta.storage_path));
         if let Some(ae) = req.get_accept_encoding() {
             for ae in ae {
                 if ae == "gzip" {
+                    let mut content_stream = cache_zone
+                        .get_object_content(
+                            &meta.storage_path,
+                            &storage::cache_zone::GetOption { rng },
+                        )
+                        .await?;
                     let mut cl = 0;
                     content_stream =
                         stream::build_gzip_encoder_stream(content_stream, Some(&mut cl)).await?;
+                    content = types::Content::Stream(content_stream);
                     meta.headers
                         .insert("content-encoding".to_string(), vec!["gzip".to_string()]);
                     let vary = "Vary".to_string();
@@ -341,7 +371,7 @@ impl ProxyServer {
         Ok(types::Response {
             status_code: ok_status,
             headers: conver_hashmap_to_header_map(meta.headers),
-            content: content_stream,
+            content: content,
         })
     }
     async fn head_request(
@@ -355,11 +385,15 @@ impl ProxyServer {
                 .map_err(|err| ErrorKind::LogicalError(format!("build logical error {err}")))?,
         );
         let headers = req.headers_mut();
-        for (k, v) in &raw_req.headers {
+        for (k, v) in raw_req.headers.iter() {
             if k.as_str() == "range" {
                 continue;
             }
-            headers.insert(k, v.clone());
+            headers.insert(
+                http::HeaderName::from_str(k.as_str()).unwrap(),
+                http::HeaderValue::from_str(unsafe { std::str::from_utf8_unchecked(v.as_bytes()) })
+                    .unwrap(),
+            );
         }
         let resp = reqwest::Client::new()
             .execute(req)
@@ -385,7 +419,11 @@ impl ProxyServer {
                 "accept-encoding" => {}
                 _ => {}
             }
-            headers.insert(k, v.clone());
+            headers.insert(
+                http::HeaderName::from_str(k.as_str()).unwrap(),
+                http::HeaderValue::from_str(unsafe { std::str::from_utf8_unchecked(v.as_bytes()) })
+                    .unwrap(),
+            );
         }
         let resp = reqwest::Client::new()
             .execute(req)
@@ -400,7 +438,7 @@ impl ProxyServer {
         Ok(types::Response {
             status_code: status,
             headers: header,
-            content: Box::pin(stream),
+            content: types::Content::Stream(Box::pin(stream)),
         })
     }
     async fn get_suitable_cache_zone(
@@ -472,7 +510,11 @@ impl ProxyServer {
         if !cc.need_cache {
             return Ok(CacheEntry::Response(resp));
         }
-        let temp_path = self.store_temp_file(resp.content).await?;
+
+        let temp_path = match resp.content {
+            types::Content::Stream(content) => self.store_temp_file(content).await?,
+            types::Content::Path(_) => panic!("build object meta response must be stream"),
+        };
 
         let fsize = match tokio::fs::metadata(&temp_path).await.map_err(|err| {
             ErrorKind::MachineError(format!("get temp file {temp_path} metadata failed {err}"))
@@ -561,10 +603,11 @@ pub async fn listen_control(address: &str) -> Result<(), String> {
         });
     }
 }
-pub async fn listen_and_server(
-    l: tokio::net::TcpListener,
-    server: Arc<ProxyServer>,
-) -> Result<(), ErrorKind> {
+#[cfg(feature = "hyper")]
+pub async fn listen_and_server(address: &str, server: Arc<ProxyServer>) -> Result<(), ErrorKind> {
+    let l = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|err| ErrorKind::MachineError(format!("bind {address} error {err}")))?;
     loop {
         let (conn, _) = l
             .accept()
@@ -583,11 +626,169 @@ pub async fn listen_and_server(
         });
     }
 }
+#[cfg(feature = "actix")]
+pub async fn listen_and_server(address: &str, server: Arc<ProxyServer>) -> Result<(), ErrorKind> {
+    use actix_web::{web, HttpResponse};
 
+    actix_web::HttpServer::new(move || {
+        actix_web::App::new()
+            .app_data(web::Data::new(server.clone()))
+            .service(
+                web::resource("/{tail:.*}") // tail 是个通配路径变量
+                    .route(web::to(handle_request)),
+            )
+    })
+    .bind(address)
+    .map_err(|err| ErrorKind::MachineError(format!("bind {address} error {err}")))?
+    .run()
+    .await
+    .map_err(|err| ErrorKind::MachineError(format!("run error {err}")))?;
+    Ok(())
+}
+async fn handle_request(
+    data: actix_web::web::Data<Arc<ProxyServer>>,
+    req: actix_web::HttpRequest,
+) -> Result<actix_web::HttpResponse<actix_web::body::BoxBody>, actix_web::Error> {
+    HANDLE_REQUEST_TOTAL.inc();
+    let headers = req.headers();
+    let host = {
+        if let Some(host) = headers.get("host") {
+            if let Ok(host) = host.to_str() {
+                Some(host)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if host.is_none() {
+        log::info!("not set host");
+        return Ok(HttpResponseBuilder::new(StatusCode::from_u16(404).unwrap())
+            .await
+            .unwrap()
+            .set_body(vec![])
+            .map_into_boxed_body());
+    }
+    let host = host.unwrap();
+    let acl = data.acl.get(host);
+    if acl.is_none() {
+        log::info!("not set acl {host}");
+        return Ok(HttpResponseBuilder::new(StatusCode::from_u16(404).unwrap())
+            .await
+            .unwrap()
+            .set_body(vec![])
+            .map_into_boxed_body());
+    }
+    let method = req.method().as_str();
+    let url_path = req.uri().path();
+    let handle: Option<ServiceHandleFunc> = {
+        let acl = acl.unwrap();
+        let mut handle: Option<ServiceHandleFunc> = None;
+        for acl in acl {
+            if acl.method_match(method) {
+                if regex::Regex::new(acl.path_match())
+                    .unwrap()
+                    .is_match(url_path)
+                {
+                    handle = Some(acl.clone().handle());
+                    break;
+                }
+            }
+        }
+        handle
+    };
+    if handle.is_none() {
+        log::info!("not set acl");
+        return Ok(HttpResponseBuilder::new(StatusCode::from_u16(404).unwrap())
+            .await
+            .unwrap()
+            .set_body(vec![])
+            .map_into_boxed_body());
+    }
+    let current = chrono::Utc::now().timestamp();
+    let ret = handle.unwrap()(
+        data.as_ref().to_owned(),
+        types::Request {
+            host: host.to_string(),
+            method: method.to_string(),
+            url_path: url_path.to_string(),
+            headers: headers.to_owned(),
+            timestamp: current,
+        },
+    )
+    .await;
+    COMPLETED_REQUEST_TOTAL.inc();
+    match ret {
+        Ok( ret) => {
+            let mut resp = HttpResponseBuilder::new(StatusCode::from_u16(ret.status_code).unwrap())
+                .await
+                .unwrap();
+            let  headers = resp.headers_mut();
+            ret.headers.iter().all(|(k, v)| {
+                headers.append(
+                    actix_http::header::HeaderName::from_str(k.as_str()).unwrap(),
+                    actix_http::header::HeaderValue::from_bytes(v.as_bytes()).unwrap(),
+                );
+                true
+            });
+            drop(headers);
+
+            match ret.content {
+                types::Content::Stream(mut content) => {
+                    let mut buff = Vec::new();
+                    let _ = content.read_to_end(&mut buff).await;
+                    RESPONSE_BYTES_TOTAL.inc_by(buff.len() as u64);
+                    let resp: actix_web::HttpResponse<Vec<u8>> = resp.set_body(buff);
+                    STREAM_RESPONSE_TOTAL.inc();
+                    return Ok(resp.map_into_boxed_body());
+                }
+                types::Content::Path(rpath) => {
+                    let file = actix_files::NamedFile::open_async(rpath).await.unwrap();
+                    let resp = file.into_response(&req);
+                    FILE_RESPONSE_TOTAL.inc();
+                    return Ok(resp);
+                }
+            }
+        }
+        Err(err) => match err {
+            ErrorKind::MachineError(err) => {
+                log::error!("{err}");
+                return Ok(HttpResponseBuilder::new(StatusCode::from_u16(500).unwrap())
+                    .await
+                    .unwrap()
+                    .set_body(vec![])
+                    .map_into_boxed_body());
+            }
+            ErrorKind::LogicalError(err) => {
+                log::error!("{err}");
+                return Ok(HttpResponseBuilder::new(StatusCode::from_u16(403).unwrap())
+                    .await
+                    .unwrap()
+                    .set_body(vec![])
+                    .map_into_boxed_body());
+            }
+            ErrorKind::OperateError(err) => {
+                log::error!("{err}");
+                return Ok(HttpResponseBuilder::new(StatusCode::from_u16(501).unwrap())
+                    .await
+                    .unwrap()
+                    .set_body(vec![])
+                    .map_into_boxed_body());
+            }
+        },
+    }
+    // post-processing
+    // Err(ErrorKind::LogicalError("to implement".to_string()))
+    todo!()
+}
+
+#[cfg(feature = "hyper")]
 async fn handle_request(
     req: hyper::Request<Incoming>,
     server: Arc<ProxyServer>,
-) -> Result<hyper::Response<Full<bytes::Bytes>>, Infallible> {
+) -> hyper::Result<hyper::Response<BoxBody<bytes::Bytes, std::io::Error>>> {
+    HANDLE_REQUEST_TOTAL.inc();
     let headers = req.headers();
     let uri = req.uri();
     let host = {
@@ -610,7 +811,11 @@ async fn handle_request(
         log::info!("request not set host");
         return Ok(hyper::Response::builder()
             .status(400)
-            .body(Full::new(bytes::Bytes::from("".as_bytes())))
+            .body(
+                Full::new(bytes::Bytes::from("".as_bytes()))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
             .unwrap());
     }
     let host = host.unwrap();
@@ -620,7 +825,11 @@ async fn handle_request(
     if let None = &acl {
         return Ok(hyper::Response::builder()
             .status(404)
-            .body(Full::new(bytes::Bytes::from("")))
+            .body(
+                Full::new(bytes::Bytes::from(""))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
             .unwrap());
     }
     let handle: Option<ServiceHandleFunc> = {
@@ -644,7 +853,11 @@ async fn handle_request(
             .status(404)
             .header("content-length", 0)
             .header("contention", "close")
-            .body(Full::new(bytes::Bytes::from("")))
+            .body(
+                Full::new(bytes::Bytes::from(""))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
             .unwrap());
     }
 
@@ -662,22 +875,29 @@ async fn handle_request(
     .await;
     COMPLETED_REQUEST_TOTAL.inc();
     match ret {
-        Ok(mut resp) => {
+        Ok(resp) => {
             let mut ret = hyper::Response::builder().status(resp.status_code);
             for (k, v) in resp.headers.iter() {
                 ret = ret.header(k, v);
             }
-            let mut buff = Vec::new();
-            if let Err(err) = resp.content.read_to_end(&mut buff).await {
-                log::error!("{method} {host} {url_path} read buff error {err}");
 
-                SERVER_INTERNAL_ERROR_TOTAL.inc();
-                return Ok(hyper::Response::builder()
-                    .status(501)
-                    .body(Full::new(bytes::Bytes::from("")))
-                    .unwrap());
-            }
-            return Ok(ret.body(Full::new(bytes::Bytes::from(buff))).unwrap());
+            // let stream = ReaderStream::new(resp.content);
+            // let stream = StreamBody::new(stream).map_ok(hyper::body::Frame::data);
+            return send_content(resp.content, ret).await;
+            // let ret = ret.body(stream.boxed()).unwrap();
+            // let mut buff = Vec::new();
+            // if let Err(err) = resp.content.read_to_end(&mut buff).await {
+            //     log::error!("{method} {host} {url_path} read buff error {err}");
+
+            //     SERVER_INTERNAL_ERROR_TOTAL.inc();
+            //     return Ok(hyper::Response::builder()
+            //         .status(501)
+            //         .body(Full::new(bytes::Bytes::from("")).boxed())
+            //         .unwrap());
+            // }
+            // todo!()
+            // return Ok(ret);
+            // return Ok(ret.body(Full::new(bytes::Bytes::from(buff))).unwrap());
         }
         Err(err) => match err {
             ErrorKind::MachineError(err) => {
@@ -685,14 +905,22 @@ async fn handle_request(
                 SERVER_INTERNAL_ERROR_TOTAL.inc();
                 return Ok(hyper::Response::builder()
                     .status(501)
-                    .body(Full::new(bytes::Bytes::from("")))
+                    .body(
+                        Full::new(bytes::Bytes::from(""))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
                     .unwrap());
             }
             ErrorKind::LogicalError(err) => {
                 log::info!("{method} {host} {url_path} logical error {err}");
                 return Ok(hyper::Response::builder()
                     .status(403)
-                    .body(Full::new(bytes::Bytes::from("")))
+                    .body(
+                        Full::new(bytes::Bytes::from(""))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
                     .unwrap());
             }
             ErrorKind::OperateError(err) => {
@@ -700,13 +928,17 @@ async fn handle_request(
                 SERVER_INTERNAL_ERROR_TOTAL.inc();
                 return Ok(hyper::Response::builder()
                     .status(500)
-                    .body(Full::new(bytes::Bytes::from("")))
+                    .body(
+                        Full::new(bytes::Bytes::from(""))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
                     .unwrap());
             }
         },
     }
 }
-
+#[instrument]
 async fn handle_metrics_request(
     req: hyper::Request<Incoming>,
 ) -> Result<hyper::Response<Full<bytes::Bytes>>, Infallible> {
@@ -963,4 +1195,36 @@ impl ShareState {
         let stat = stat.unwrap();
         stat.wait().await
     }
+}
+
+async fn send_content<T: tokio::io::AsyncRead + Send + 'static + Sync + Unpin>(
+    mut file: T,
+    ret: hyper::http::response::Builder,
+) -> hyper::Result<http::Response<BoxBody<bytes::Bytes, std::io::Error>>> {
+    // // Wrap to a tokio_util::io::ReaderStream
+    // let reader_stream = ReaderStream::new(file);
+
+    // // Convert to http_body_util::BoxBody
+    // let stream_body: StreamBody<
+    //     futures_util::stream::MapOk<
+    //         ReaderStream<T>,
+    //         fn(bytes::Bytes) -> hyper::body::Frame<bytes::Bytes>,
+    //     >,
+    // > = StreamBody::new(reader_stream.map_ok(hyper::body::Frame::data));
+    // let boxed_body: BoxBody<bytes::Bytes, std::io::Error> = stream_body.boxed();
+    let mut buf = Vec::new();
+    let _ = file.read_to_end(&mut buf).await;
+    RESPONSE_BYTES_TOTAL.inc_by(buf.len() as u64);
+    // Send response
+    let response: http::Response<BoxBody<bytes::Bytes, std::io::Error>> = ret
+        .status(hyper::StatusCode::OK)
+        // .body(boxed_body)
+        .body(
+            Full::new(bytes::Bytes::from(buf))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
+        .unwrap();
+
+    Ok(response)
 }

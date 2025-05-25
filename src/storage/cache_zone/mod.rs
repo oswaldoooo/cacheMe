@@ -22,6 +22,7 @@ pub trait CacheZone {
     fn is_ok(&self) -> bool;
     ///逻辑可用大小，非实际
     fn state(&self) -> CacheState;
+    fn get_object_path(&self,path:&str)->String;
     async fn get_object_content(
         &self,
         path: &str,
