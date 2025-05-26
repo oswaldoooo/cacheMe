@@ -35,8 +35,8 @@ enum CacheEntry {
 pub mod cache;
 pub mod storage;
 mod stream;
+mod transport;
 pub mod types;
-
 macro_rules! insert_header_value {
     ($header:expr,$key:expr,$val:expr) => {
         match $header.get_mut(&$key) {
@@ -73,8 +73,7 @@ lazy_static! {
         prometheus::register_int_counter!("stream_response_total", "stream response total")
             .unwrap();
     static ref FILE_RESPONSE_TOTAL: prometheus::IntCounter =
-        prometheus::register_int_counter!("file_response_total", "file response total")
-            .unwrap();
+        prometheus::register_int_counter!("file_response_total", "file response total").unwrap();
     static ref RESPONSE_BYTES_TOTAL: prometheus::IntCounter =
         prometheus::register_int_counter!("response_bytes_total", "response bytes total").unwrap();
     static ref SERVER_INTERNAL_ERROR_TOTAL: prometheus::IntCounter =
@@ -319,9 +318,9 @@ impl ProxyServer {
         }
         meta.last_ref_time = req.timestamp;
         meta.ref_count = meta.ref_count + 1;
-        // if let Err(err) = self.cache.put_object(&hash, &meta).await {
-        //     log::error!("put object metadata failed {err}");
-        // }
+        if let Err(err) = self.cache.put_object(&hash, &meta).await {
+            log::error!("put object metadata failed {err}");
+        }
         let mut ok_status = meta.status_code;
         if rng.1 > 0 || rng.0 > 0 {
             let end = if rng.1 > 0 {
@@ -344,7 +343,14 @@ impl ProxyServer {
             "x-cache".to_string(),
             vec![if is_hit { "HIT" } else { "MISS" }.to_string()],
         );
+        #[cfg(feature = "file")]
         let mut content = types::Content::Path(cache_zone.get_object_path(&meta.storage_path));
+        #[cfg(feature = "stream")]
+        let mut content = types::Content::Stream(
+            cache_zone
+                .get_object_content(&meta.storage_path, &storage::cache_zone::GetOption { rng })
+                .await?,
+        );
         if let Some(ae) = req.get_accept_encoding() {
             for ae in ae {
                 if ae == "gzip" {
@@ -645,6 +651,7 @@ pub async fn listen_and_server(address: &str, server: Arc<ProxyServer>) -> Resul
     .map_err(|err| ErrorKind::MachineError(format!("run error {err}")))?;
     Ok(())
 }
+#[cfg(feature = "actix")]
 async fn handle_request(
     data: actix_web::web::Data<Arc<ProxyServer>>,
     req: actix_web::HttpRequest,
@@ -707,6 +714,7 @@ async fn handle_request(
             .map_into_boxed_body());
     }
     let current = chrono::Utc::now().timestamp();
+    let now = tokio::time::Instant::now();
     let ret = handle.unwrap()(
         data.as_ref().to_owned(),
         types::Request {
@@ -718,13 +726,15 @@ async fn handle_request(
         },
     )
     .await;
+    let take = now.elapsed();
+
     COMPLETED_REQUEST_TOTAL.inc();
     match ret {
-        Ok( ret) => {
+        Ok(ret) => {
             let mut resp = HttpResponseBuilder::new(StatusCode::from_u16(ret.status_code).unwrap())
                 .await
                 .unwrap();
-            let  headers = resp.headers_mut();
+            let headers = resp.headers_mut();
             ret.headers.iter().all(|(k, v)| {
                 headers.append(
                     actix_http::header::HeaderName::from_str(k.as_str()).unwrap(),
@@ -745,7 +755,15 @@ async fn handle_request(
                 }
                 types::Content::Path(rpath) => {
                     let file = actix_files::NamedFile::open_async(rpath).await.unwrap();
-                    let resp = file.into_response(&req);
+                    let mut resp = file.into_response(&req);
+                    let headers = resp.headers_mut();
+                    ret.headers.iter().all(|(k, v)| {
+                        headers.append(
+                            actix_http::header::HeaderName::from_str(k.as_str()).unwrap(),
+                            actix_http::header::HeaderValue::from_bytes(v.as_bytes()).unwrap(),
+                        );
+                        true
+                    });
                     FILE_RESPONSE_TOTAL.inc();
                     return Ok(resp);
                 }
@@ -1227,4 +1245,135 @@ async fn send_content<T: tokio::io::AsyncRead + Send + 'static + Sync + Unpin>(
         .unwrap();
 
     Ok(response)
+}
+
+#[cfg(feature = "cache_me_http")]
+pub async fn listen_and_server(address: &str, server: Arc<ProxyServer>) -> Result<(), ErrorKind> {
+    let l = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|err| ErrorKind::MachineError(format!("bind {address} error {err}")))?;
+
+    loop {
+        let (conn, _) = l
+            .accept()
+            .await
+            .map_err(|err| ErrorKind::MachineError(format!("listener accept error {err}")))?;
+        let value = server.clone();
+        tokio::spawn(transport::http::server_connection(conn, move |ctx| {
+            let value = value.clone();
+            async move { handle_request(ctx, value).await }
+        }));
+    }
+}
+
+#[cfg(feature = "cache_me_http")]
+async fn handle_request(
+    mut ctx: transport::http::HttpContext,
+    data: Arc<ProxyServer>,
+) -> transport::http::HttpContext {
+    let headers = ctx.headers();
+    let host = {
+        if let Some(host) = headers.get("host") {
+            if let Ok(host) = host.to_str() {
+                Some(host)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if host.is_none() {
+        log::info!("not found host");
+        ctx.send_header(Some(404)).await;
+        return ctx;
+    }
+    let host = host.unwrap();
+
+    let url_path = ctx.uri().path();
+    let method = ctx.method();
+    let acl = data.acl.get(host);
+    if let None = &acl {
+        log::info!("not found acl");
+        ctx.send_header(Some(404)).await;
+        return ctx;
+    }
+    let handle: Option<ServiceHandleFunc> = {
+        let acl = acl.unwrap();
+        let mut handle: Option<ServiceHandleFunc> = None;
+        for acl in acl {
+            if acl.method_match(method) {
+                if regex::Regex::new(acl.path_match())
+                    .unwrap()
+                    .is_match(url_path)
+                {
+                    handle = Some(acl.clone().handle());
+                    break;
+                }
+            }
+        }
+        handle
+    };
+    if handle.is_none() {
+        log::info!("not found acl handle");
+        ctx.send_header(Some(404)).await;
+        return ctx;
+    }
+
+    let current = chrono::Utc::now().timestamp();
+    let ret = handle.unwrap()(
+        data,
+        types::Request {
+            host: host.to_string(),
+            method: method.to_string(),
+            url_path: url_path.to_string(),
+            headers: headers.to_owned(),
+            timestamp: current,
+        },
+    )
+    .await;
+    COMPLETED_REQUEST_TOTAL.inc();
+    match ret {
+        Ok(ret) => {
+            ctx.set_status(ret.status_code);
+            let headers = ctx.response_header_mut();
+            ret.headers.iter().all(|(k, v)| {
+                headers.append(k, v.clone());
+                true
+            });
+            drop(headers);
+            ctx.send_header(None).await;
+            match ret.content {
+                types::Content::Stream(mut stream) => {
+                    let _ = tokio::io::copy(&mut stream, &mut ctx.response_body()).await;
+                }
+                types::Content::Path(rpath) => {
+                    ctx = tokio::task::spawn_blocking(move || {
+                        if let Err(err) = ctx.send_file(&rpath) {
+                            log::error!("{err}");
+                        }
+                        ctx
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+            return ctx;
+        }
+        Err(err) => match err {
+            ErrorKind::MachineError(err) => {
+                log::error!("{err}");
+                ctx.send_header(Some(500)).await;
+            }
+            ErrorKind::LogicalError(err) => {
+                log::error!("{err}");
+                ctx.send_header(Some(403)).await;
+            }
+            ErrorKind::OperateError(err) => {
+                log::error!("{err}");
+                ctx.send_header(Some(501)).await;
+            }
+        },
+    }
+    ctx
 }
