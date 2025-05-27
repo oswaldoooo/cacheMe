@@ -35,3 +35,23 @@ pub async fn build_gzip_encoder_stream<T: AsyncRead + Send + Unpin>(
         data,
     ))))
 }
+
+pub struct ChunkWriter {
+    boundary: String,
+    data: Vec<u8>,
+}
+
+impl ChunkWriter {
+    pub async fn write_chunk(&mut self, data: &[u8]) {
+        let _ = self
+            .data
+            .write_all(format!("{:x}\r\n", data.len()).as_bytes());
+        self.data.copy_from_slice(data);
+        self.data.push(b'\r');
+        self.data.push(b'\n');
+    }
+    pub async fn finalize(&mut self) -> &[u8] {
+        self.data.copy_from_slice(b"0\r\n\r\n");
+        &self.data
+    }
+}

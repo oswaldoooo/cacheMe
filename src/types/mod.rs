@@ -1,5 +1,8 @@
 use std::pin::Pin;
 
+#[cfg(feature="mp4")]
+pub mod mp4;
+
 pub mod acl;
 pub mod metadata;
 pub type Hash = String;

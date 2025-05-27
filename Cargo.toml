@@ -8,7 +8,8 @@ stream=[]
 cache_me_http=[]
 hyper=[]
 actix=[]
-default=["cache_me_http","stream"]
+mp4=[]
+default=["hyper","stream","mp4"]
 [dependencies]
 actix-files = "0.6.6"
 actix-http = "3.11.0"
