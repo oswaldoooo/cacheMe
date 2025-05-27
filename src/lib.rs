@@ -35,7 +35,6 @@ enum CacheEntry {
 pub mod cache;
 pub mod storage;
 mod stream;
-mod transport;
 pub mod types;
 macro_rules! insert_header_value {
     ($header:expr,$key:expr,$val:expr) => {
@@ -898,10 +897,30 @@ async fn handle_request(
             for (k, v) in resp.headers.iter() {
                 ret = ret.header(k, v);
             }
-
+            match resp.content {
+                types::Content::Stream(content) => {
+                    return send_content(content, ret).await;
+                }
+                types::Content::Path(fpath) => {
+                    let fd = tokio::fs::OpenOptions::new().read(true).open(&fpath).await;
+                    if let Err(err) = &fd {
+                        log::error!("open file {fpath} error {err}");
+                        return Ok(hyper::Response::builder()
+                            .status(500)
+                            .body(
+                                Full::new(bytes::Bytes::from(""))
+                                    .map_err(|e| match e {})
+                                    .boxed(),
+                            )
+                            .unwrap());
+                    }
+                    let fd = fd.unwrap();
+                    return send_content(fd, ret).await;
+                }
+            }
             // let stream = ReaderStream::new(resp.content);
             // let stream = StreamBody::new(stream).map_ok(hyper::body::Frame::data);
-            return send_content(resp.content, ret).await;
+
             // let ret = ret.body(stream.boxed()).unwrap();
             // let mut buff = Vec::new();
             // if let Err(err) = resp.content.read_to_end(&mut buff).await {
